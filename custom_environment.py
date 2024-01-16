@@ -19,13 +19,10 @@ def preProcessData(file):
     df.rename(columns={df.columns[0]: "datetime"}, inplace=True)
     return df
 
-def episode(df, day):
-
+def episode(df, date):
+    # filter df by day
     df['datetime'] = pd.to_datetime(df['datetime'])
-    
-    # 筛选特定日期的数据
-    specific_date = '2019-12-30'
-    filtered_df = df[df['datetime'].dt.date == pd.to_datetime(specific_date).date()]
+    filtered_df = df[df['datetime'].dt.date == pd.to_datetime(date).date()]
     # 显示结果
     return filtered_df
 
@@ -52,14 +49,16 @@ class FuturesTradingEnv(gym.Env):
         # actions 有两个，long，short
         self.action_space = spaces.Discrete(2)
         self.market_data = preProcessData(data_file_path)
-        self.len = len(self.market_data)
+
     def _init_account(self):
         principal = 5e5 # 本金
         return {
-            "profit": 0,
             "margin": principal,
             "principal": principal,
-            "a_pre": 0 # TODO: 在计算reward 时，需要a_pre,但是第一个a如何计算？
+            "hold_float": 0, 
+            "step_hold_profit": 0, 
+            "profit": 0,
+            "position": 0, 
         }
     def step(self, action):
         # 处理一步交易逻辑
@@ -67,25 +66,34 @@ class FuturesTradingEnv(gym.Env):
         if action==0:
             action = -1
         # 返回observation, reward, done, info
-        # self.t = t
-        done = (self.t == self.len)
-        # o_{t}, a_t (根据0~t-1的历史做出决定，在t实现action) -> r_t (在t实现a_t 交易行为，产生的account profit)
-        reward = (self.market_data[t]["close"] - self.market_data[t-1]["close"] - 2*self.slip)*self.account_info["a_pre"] \
-                    - self.trans_fee*np.abs(self.account_info["a_pre"] - action)*self.market_data[t]["close"] # p_t^c - p_t-1^c .....
-        self.account_info["a_pre"] = action
-        self.t += 1
-        observation = self.market_data[self.t - self.win_len: self.t] 
+        # self.t = t 
         
+        # o_{t}, a_t (根据0~t-1的历史做出决定，在t实现action) -> r_t (在t实现a_t 交易行为，产生的account profit)
+        self.trade(action) # update self.account_info
         info = self.account_info
-        # 更新info
+        
+        reward = self.DSR_reward(action)
+        self.t += 1 # 顺序很重要
+        observation = self.market_data[self.t - self.win_len: self.t] 
+        done = (self.t == self.len)
+        
         return observation, reward, done, info
 
     def reset(self):
         # 模型输入需要观察wein_len 宽的历史数据，因此开票之后需要等一等
-        self.t = self.win_len 
-        self.market_obs = self.market_data[self.t - self.win_len: self.t] # [0, t-1]
+        self.t = self.win_len
+        self.market_data_day = episode(df=self.market_data, 
+                                       # randomDate(start, end, format)
+                                       date="2019-12-30"
+                                      ) 
+        # print("market_data_day", self.market_data_day)
+        self.market_obs = self.market_data_day[self.t - self.win_len: self.t] # [0, t-1]
+        # print("market_obs", self.market_obs)
+        self.len = len(self.market_data_day)
         # 初始化账号信息
-        self.account_info = self._get_info()
+        self.account_info = self._init_account()
+        # 初始化At0, Bt0, 为计算differential Sharpe radio
+        self.At0, self.Bt0 = 0, 0
         # 返回初始观察值, account_info
         return self.market_obs, self.account_info
 
@@ -96,18 +104,97 @@ class FuturesTradingEnv(gym.Env):
     def close(self):
         # 可选：清理工作
         pass
+    def trade(self, action):
+        """
+        参考https://github.com/nctu-dcs-lab/iRDPG-for-Quantitative-Trading-on-Stock-Index-Futures/blob/main/environment.py中的trading 函数，模拟交易过程
+        """
+        if action==0:
+            print('trading_action is zero, which is wrong.')
+            raise AssertionError('trading_action is zero')
+            
+        pc_t, pc_t_ = self.market_data_day.iloc[self.t].loc["close"], self.market_data_day.iloc[self.t-1].loc["close"] # p_t, p_t-1
+        info = self.account_info
+        margin, principal, hold_float, step_hold_profit, profit, position = info.values()
 
+        '''### 依「交易訊號&持單狀態」執行交易rules ###'''
+        if action == 1:  #action為交易訊號：{1=long, -1=short}
+            if position == 1:  #position為agent下單狀態：{-1=空單, 0=無單, 1=多單}
+                profit = 0
+                step_hold_profit = (pc_t - pc_t_)*position
+                hold_float += step_hold_profit
+                margin += hold_float*self.contract_multiplier
+            elif position == 0: 
+                profit = 0
+                #long->hold, margin值不会马上变化
+                position = 1
+            elif position ==-1:
+                step_hold_profit= ((pc_t-pc_t_)*position - 2*self.slip) \
+                    - self.trans_fee*np.abs(position - action)*pc_t
+                profit = step_hold_profit + hold_float  # TODO: 和论文不一样，和参考仓库一样
+                margin += hold_float*self.contract_multiplier
+                hold_float = 0  #change position, 归零
+                position = 1
+                     
+        elif action == -1:
+            if position == 1:
+                # self.step_hold_profit = self.profit
+                step_hold_profit = ((pc_t-pc_t_)*position - 2*self.slip) \
+                    - self.trans_fee*np.abs(position-action)*pc_t
+                profit = step_hold_profit + hold_float
+                hold_float = 0
+                margin += hold_float*self.contract_multiplier
+                position = -1
+            elif position == 0:
+                profit = 0
+                # short后，hold,margin值不会马上变化
+                position = -1
+            elif position ==-1:
+                profit = 0
+                step_hold_profit = (pc_t-pc_t_)*position
+                hold_float += step_hold_profit
+                margin += hold_float*self.contract_multiplier
+        self.account_info = {
+            "margin": margin,
+            "principal": principal,
+            "hold_float": hold_float, 
+            "step_hold_profit": step_hold_profit, 
+            "profit": profit,
+            "position": position, 
+        }
+    def DSR_reward(self, action):
+        """
+        参考https://github.com/nctu-dcs-lab/iRDPG-for-Quantitative-Trading-on-Stock-Index-Futures/blob/main/environment.py中的DSR_reward2 函数，
+        计算differential Sharpe ratio 作为reward(即时奖励)
+        """
+        eta = 1/self.t # decay, 也可尝试使用常数
+        # eta = 1/240
+        info = self.account_info
+        margin, principal, hold_float, step_hold_profit, profit, position = info.values()
+        pc_t, pc_t_ = self.market_data_day.iloc[self.t].loc["close"], self.market_data_day.iloc[self.t-1].loc["close"] # p_t, p_t-1
+        ### Calculate step return #####
+        r_t = (pc_t-pc_t_ - 2*self.slip)*position \
+                    - self.trans_fee*np.abs(position - action)*pc_t
+
+        d_t = (self.Bt0*(r_t-self.At0)- 0.5*self.At0*(r_t**2-self.Bt0))/\
+            (self.Bt0 - self.At0**2)**1.5
+        
+        ### update At0 & Bt0 ###
+        self.At0 = eta*r_t + (1-eta)*self.At0
+        self.Bt0 = eta*r_t**2 + (1-eta)*self.Bt0
+        return d_t
+    
 #     def 
-# # 使用环境的示例
-# env = FuturesTradingEnv(data_fn="your_data.csv", ...)
-# observation = env.reset()
-# done = False
-# while not done:
-#     action = env.action_space.sample()  # 或者您的代理生成的行动
-#     observation, reward, done, info = env.step(action)
-#     env.render()
-# env.close()
-df = preProcessData("./data/IC_2015to2018.csv")
-print(type(df.iloc[0, 0]))
-df = episode(df, "2019-12-30")
-print(df)
+# 使用环境的示例
+env = FuturesTradingEnv(win_len=30, data_file_path="./data/IC_2015to2018.csv", furtures="IC")
+observation = env.reset()
+done = False
+while not done:
+    action = env.action_space.sample()  # 或者您的代理生成的行动
+    observation, reward, done, info = env.step(action)
+    print(observation.shape, reward, done, info)
+    env.render()
+env.close()
+# df = preProcessData("./data/IC_2015to2018.csv")
+# print(type(df.iloc[0, 0]))
+# df = episode(df, "2019-12-30")
+# print(df)
