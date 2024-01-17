@@ -183,17 +183,25 @@ class FuturesTradingEnv(gym.Env):
         self.Bt0 = eta*r_t**2 + (1-eta)*self.Bt0
         return d_t
     
-#     def 
 # 使用环境的示例
 env = FuturesTradingEnv(win_len=30, data_file_path="./data/IC_2015to2018.csv", furtures="IC")
 observation = env.reset()
 done = False
+import matplotlib.pyplot as plt
+reward_list = []
+profit_list = []
 while not done:
     action = env.action_space.sample()  # 或者您的代理生成的行动
     observation, reward, done, info = env.step(action)
+    reward_list.append(reward)
+    profit_list.append(info["profit"])
     print(observation.shape, reward, done, info)
     env.render()
 env.close()
+plt.plot(reward_list, label="reward")
+plt.plot(profit_list, label="profit")
+
+plt.savefig("./reward.png")
 # df = preProcessData("./data/IC_2015to2018.csv")
 # print(type(df.iloc[0, 0]))
 # df = episode(df, "2019-12-30")
