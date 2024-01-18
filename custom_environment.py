@@ -2,6 +2,11 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 import pandas as pd
+import random
+
+# 常数
+K_1 = 0.5
+K_2 = 0.5
 
 def randomDate(start, end, format):
     stime = datetime.strptime(start, format)
@@ -23,10 +28,20 @@ def episode(df, date):
     # filter df by day
     df['datetime'] = pd.to_datetime(df['datetime'])
     filtered_df = df[df['datetime'].dt.date == pd.to_datetime(date).date()]
-    # 显示结果
-    return filtered_df
+    # 显示结果 
+    output_columns = ['open', 'close', 'high', 'low', 'volume']
+    return filtered_df[output_columns]
 
-# def sample(df, )
+def store_date(df):
+    """
+    df -> ["2019-12-30", .....] 这样的日期
+    """
+    formatted_list = df['datetime'].apply(lambda x: x.strftime('%Y-%m-%d')).tolist()
+    # 去重
+    unique_list = list(set(formatted_list))
+    # 随机打乱
+    random.shuffle(unique_list)
+    return unique_list
 
 class FuturesTradingEnv(gym.Env):
     def __init__(self, win_len, data_file_path, furtures):
@@ -49,7 +64,21 @@ class FuturesTradingEnv(gym.Env):
         # actions 有两个，long，short
         self.action_space = spaces.Discrete(2)
         self.market_data = preProcessData(data_file_path)
-
+        self.date_list = store_date(self.market_data)
+        print(self.date_list)
+        self.date_idx = 0
+        self.tot_date = len(self.date_list)
+        # observation: 过去的market data，Indicator(BuyLine, SellLine), account_profit
+        self.observation_space = spaces.Dict(
+            {
+                "market_data": spaces.Box(low=-np.inf, high=np.inf, shape=(self.win_len, 5), dtype=np.float32), # 5: open, close, high, low, volume
+                "indicators": spaces.Box(low=-np.inf, high=np.inf, shape=(2, ), dtype=np.float32),
+                # "account": spaces.Box(low=-np.inf, high=np.inf, shape=(2, ), dtype=np.float32) 
+            }
+        )
+        # self.observation_space = episode(df=self.market_data, date="2019-12-30")[0: self.win_len] # 选一天的示例，计算observation_space
+        # print(type(self.observation_space))
+        # print(self.observation_space)
     def _init_account(self):
         principal = 5e5 # 本金
         return {
@@ -79,15 +108,23 @@ class FuturesTradingEnv(gym.Env):
         
         return observation, reward, done, info
 
-    def reset(self):
+    def reset(self, date_idx=0):
+        self.date_idx += 1 # 下一次reset 随机到另一天的数据
         # 模型输入需要观察wein_len 宽的历史数据，因此开票之后需要等一等
         self.t = self.win_len
         self.market_data_day = episode(df=self.market_data, 
                                        # randomDate(start, end, format)
-                                       date="2019-12-30"
+                                       date=self.date_list[date_idx]
                                       ) 
         # print("market_data_day", self.market_data_day)
-        self.market_obs = self.market_data_day[self.t - self.win_len: self.t] # [0, t-1]
+        self.market_obs = self.market_data_day[self.t - self.win_len: self.t] # [0, t-1] ['open', 'close', 'high', 'low', 'volume']
+        HH, LC = self.market_obs['high'].max(), self.market_obs['close'].min()
+        HC, LL = self.market_obs['close'].max(), self.market_obs['low'].min()
+        range = max(HH - LC, HC - LL)
+        print(type(self.market_obs["open"]))
+        open = self.market_obs["open"].iloc[-1]
+        # BuyLine, SellLine
+        self.indicators = [open + K_1 * range, open - K_2 * range]
         # print("market_obs", self.market_obs)
         self.len = len(self.market_data_day)
         # 初始化账号信息
@@ -95,7 +132,11 @@ class FuturesTradingEnv(gym.Env):
         # 初始化At0, Bt0, 为计算differential Sharpe radio
         self.At0, self.Bt0 = 0, 0
         # 返回初始观察值, account_info
-        return self.market_obs, self.account_info
+        observation = {
+            "market_data": self.market_obs, # 5: open, close, high, low, volume
+            "indicators": self.indicators
+        }
+        return observation, self.account_info
 
     def render(self, mode='human'):
         # 可选：渲染环境状态
@@ -172,11 +213,12 @@ class FuturesTradingEnv(gym.Env):
         margin, principal, hold_float, step_hold_profit, profit, position = info.values()
         pc_t, pc_t_ = self.market_data_day.iloc[self.t].loc["close"], self.market_data_day.iloc[self.t-1].loc["close"] # p_t, p_t-1
         ### Calculate step return #####
-        r_t = (pc_t-pc_t_ - 2*self.slip)*position \
-                    - self.trans_fee*np.abs(position - action)*pc_t
+        r_t = (pc_t-pc_t_ - 2*self.slip)*position - self.trans_fee*np.abs(position - action)*pc_t
 
-        d_t = (self.Bt0*(r_t-self.At0)- 0.5*self.At0*(r_t**2-self.Bt0))/\
-            (self.Bt0 - self.At0**2)**1.5
+        if self.Bt0 - self.At0**2 ==0:
+            d_t = 0
+        else:
+            d_t = (self.Bt0*(r_t-self.At0)- 0.5*self.At0*(r_t**2-self.Bt0))/(self.Bt0 - self.At0**2)**1.5
         
         ### update At0 & Bt0 ###
         self.At0 = eta*r_t + (1-eta)*self.At0
@@ -185,7 +227,7 @@ class FuturesTradingEnv(gym.Env):
     
 # 使用环境的示例
 env = FuturesTradingEnv(win_len=30, data_file_path="./data/IC_2015to2018.csv", furtures="IC")
-observation = env.reset()
+observation = env.reset(env.date_idx)
 done = False
 import matplotlib.pyplot as plt
 reward_list = []
@@ -195,7 +237,7 @@ while not done:
     observation, reward, done, info = env.step(action)
     reward_list.append(reward)
     profit_list.append(info["profit"])
-    print(observation.shape, reward, done, info)
+    # print(observation.shape, reward, done, info)
     env.render()
 env.close()
 plt.plot(reward_list, label="reward")
